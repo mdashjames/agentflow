@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "distribution": "harbor",
+  "version": "0.23.0",
+  "implementation": "harbor.agents.terminus_2.terminus_2.Terminus2",
+  "requires_python": ">=3.12",
+  "wheel_url": "https://files.pythonhosted.org/packages/19/c7/607ff037dff1f40d1f941b9854742d66fd43630274fd4e7b8de8480dad34/harbor-0.23.0-py3-none-any.whl",
+  "wheel_sha256": "8747400dbb2a5e2298e1338e17e88eba38433c0433fd700f34d1a9021bba5c37"
+}

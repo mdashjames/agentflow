@@ -2,6 +2,10 @@
 
 Orchestrate Codex, Claude, Kimi, and Pi agents in dependency graphs with parallel fanout, iterative cycles, and execution on local Docker, SSH, EC2, or ECS targets.
 
+Typed actor nodes, explicit agent profiles, credential-safe Docker preparation,
+and the Harbor Terminus 2 adapter are described in
+[Actors and profiles](docs/actors-and-profiles.md).
+
 ![AgentFlow Graph](docs/graph.png)
 *94-node pipeline: plan → 64 workers → 8 batch merges → 16 reviews → 4 review merges → synthesis*
 

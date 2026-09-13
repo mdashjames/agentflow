@@ -567,7 +567,7 @@ def test_sync_adapter_rejects_docker_target_before_building_invalid_ssh_command(
         SyncAdapter().prepare(node, "full", _paths(tmp_path))
 
 
-def test_codex_docker_credentials_are_opt_in(tmp_path: Path, monkeypatch):
+def test_codex_docker_credentials_require_explicit_secret_files(tmp_path: Path, monkeypatch):
     home = tmp_path / "home"
     codex_home = home / ".codex"
     codex_home.mkdir(parents=True)
@@ -577,18 +577,11 @@ def test_codex_docker_credentials_are_opt_in(tmp_path: Path, monkeypatch):
     paths = _paths(tmp_path)
 
     isolated = CodexAdapter().prepare(_node({"kind": "docker"}), "hi", paths)
-    inherited = CodexAdapter().prepare(
-        _node({"kind": "docker", "inherit_credentials": True}),
-        "hi",
-        paths,
-    )
-
     assert isolated.runtime_symlinks == {}
-    assert inherited.runtime_symlinks == {
-        "codex_home/config.toml": str(codex_home / "config.toml"),
-        "codex_home/auth.json": str(codex_home / "auth.json"),
-    }
-    assert inherited.env["CODEX_HOME"] == "/agentflow-runtime/codex_home"
+    with pytest.raises(ValueError, match="explicit secret files"):
+        CodexAdapter().prepare(
+            _node({"kind": "docker", "inherit_credentials": True}), "hi", paths,
+        )
 
 
 def test_runtime_materialization_uses_private_permissions(tmp_path: Path):

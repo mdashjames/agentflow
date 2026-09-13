@@ -40,6 +40,7 @@ class AgentKind(StrEnum):
     CLAUDE = "claude"
     KIMI = "kimi"
     PI = "pi"
+    TERMINUS = "terminus"
     PYTHON = "python"
     SHELL = "shell"
     SYNC = "sync"
@@ -87,7 +88,7 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
-_INTERACTIVE_AGENT_KINDS = {AgentKind.CODEX, AgentKind.CLAUDE, AgentKind.KIMI, AgentKind.PI}
+_INTERACTIVE_AGENT_KINDS = {AgentKind.CODEX, AgentKind.CLAUDE, AgentKind.KIMI, AgentKind.PI, AgentKind.TERMINUS}
 
 
 def normalize_agent_name(value: str | AgentKind) -> str:
@@ -108,6 +109,36 @@ def builtin_agent_kind(value: str | AgentKind | None) -> AgentKind | None:
         return AgentKind(normalized)
     except ValueError:
         return None
+
+
+class SecretRef(BaseModel):
+    """A file already injected into the execution target by the caller.
+
+    Resolution happens in that target, never while preparing a node on the host.
+    This declaration does not authorize a mount or a network route.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    path: str
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts or "\x00" in value:
+            raise ValueError("secret references require an absolute target file path")
+        return value
+
+
+class ModelSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    context_window: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    reasoning_effort: str | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_turns: int | None = Field(default=None, gt=0)
+    web_search: Literal["disabled", "cached", "live"] | None = None
 
 
 class ProviderConfig(BaseModel):
@@ -334,6 +365,11 @@ class MCPServerSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    env_http_headers: dict[str, str] = Field(default_factory=dict)
+    bearer_token_env_var: str | None = None
+    secret_env: dict[str, SecretRef] = Field(default_factory=dict)
+    startup_timeout_sec: float | None = Field(default=None, gt=0)
+    tool_timeout_sec: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def validate_transport_fields(self) -> "MCPServerSpec":
@@ -345,6 +381,8 @@ class MCPServerSpec(BaseModel):
                 unsupported_fields.append("url")
             if self.headers:
                 unsupported_fields.append("headers")
+            if self.env_http_headers or self.bearer_token_env_var:
+                unsupported_fields.append("HTTP authentication")
         else:
             if not self.url or not self.url.strip():
                 raise ValueError("streamable_http MCP servers require `url`")
@@ -1619,6 +1657,11 @@ class NodeSpec(BaseModel):
     on_failure_restart: list[str] = Field(default_factory=list)
     model: str | None = None
     provider: str | ProviderConfig | None = None
+    model_settings: ModelSettings = Field(default_factory=ModelSettings)
+    secret_env: dict[str, SecretRef] = Field(default_factory=dict)
+    actor: dict[str, Any] | None = None
+    agent_profile: dict[str, Any] | None = None
+    extensions: list[str] = Field(default_factory=list)
     tools: ToolAccess = ToolAccess.READ_ONLY
     mcps: list[MCPServerSpec] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
@@ -2393,7 +2436,7 @@ class NormalizedTraceEvent(BaseModel):
 
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     node_id: str
-    agent: AgentKind
+    agent: AgentKind | str
     attempt: int = 1
     source: Literal["stdout", "stderr", "system"] = "stdout"
     kind: str

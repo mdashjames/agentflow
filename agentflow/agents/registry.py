@@ -5,6 +5,7 @@ from agentflow.agents.claude import ClaudeAdapter
 from agentflow.agents.codex import CodexAdapter
 from agentflow.agents.kimi import KimiAdapter
 from agentflow.agents.pi import PiAdapter
+from agentflow.agents.terminus import TerminusAdapter
 from agentflow.agents.util import PythonAdapter, ShellAdapter, SyncAdapter
 from agentflow.specs import AgentKind
 
@@ -16,16 +17,20 @@ class AdapterRegistry:
             AgentKind.CLAUDE: ClaudeAdapter(),
             AgentKind.KIMI: KimiAdapter(),
             AgentKind.PI: PiAdapter(),
+            AgentKind.TERMINUS: TerminusAdapter(),
             AgentKind.PYTHON: PythonAdapter(),
             AgentKind.SHELL: ShellAdapter(),
             AgentKind.SYNC: SyncAdapter(),
         }
 
-    def register(self, kind: AgentKind, adapter: AgentAdapter) -> None:
+    def register(self, kind: AgentKind | str, adapter: AgentAdapter) -> None:
         self._registry[kind] = adapter
 
-    def get(self, kind: AgentKind) -> AgentAdapter:
+    def get(self, kind: AgentKind | str) -> AgentAdapter:
         return self._registry[kind]
+
+    def contains(self, kind: AgentKind | str) -> bool:
+        return kind in self._registry
 
 
 default_adapter_registry = AdapterRegistry()

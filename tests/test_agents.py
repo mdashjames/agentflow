@@ -164,7 +164,7 @@ def test_codex_adapter_isolates_home_when_runtime_codex_home_is_used(tmp_path):
     expected_home = str(tmp_path / ".runtime" / "codex_home")
     assert prepared.env["CODEX_HOME"] == expected_home
     assert prepared.env["HOME"] == expected_home
-    assert prepared.runtime_files.keys() == {"codex_home/config.toml"}
+    assert prepared.runtime_files.keys() == {"codex_home/config.toml", "codex_home/agentflow.config.toml"}
 
 
 def test_codex_adapter_can_ignore_repo_instructions_with_isolated_runtime_cwd(tmp_path):

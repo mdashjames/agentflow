@@ -1120,7 +1120,7 @@ def build_launch_inspection(
 
         prompt, render_error = _render_prompt_for_inspection(pipeline, node, placeholder_results)
         uses_placeholder_results = uses_placeholder_results or _prompt_uses_placeholder_results(prompt)
-        execution_resolution = resolve_node_for_execution(node, pipeline.working_path)
+        execution_resolution = resolve_node_for_execution(node, pipeline.working_path, registry=adapters)
         execution_node = execution_resolution.node
         resolved_provider = resolve_execution_provider(execution_node.provider, execution_node.agent)
         paths = build_execution_paths(
@@ -1137,7 +1137,7 @@ def build_launch_inspection(
         node_plan = {
             "id": node.id,
             "agent": normalize_agent_name(node.agent),
-            "runtime_agent": execution_resolution.runtime_agent.value,
+            "runtime_agent": normalize_agent_name(execution_resolution.runtime_agent),
             "model": node.model,
             "schedule": node.schedule.model_dump(mode="json") if node.schedule is not None else None,
             "tools": node.tools.value,

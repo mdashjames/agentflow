@@ -1003,7 +1003,7 @@ class Orchestrator:
             current_tick_number=periodic_tick_number,
             current_tick_started_at=periodic_tick_started_at,
         )
-        execution_resolution = resolve_node_for_execution(node, pipeline.working_path)
+        execution_resolution = resolve_node_for_execution(node, pipeline.working_path, registry=self.adapters)
         execution_node = execution_resolution.node
         runtime_agent = execution_resolution.runtime_agent
         # Create git worktree if enabled (local nodes only get a worktree directory)
@@ -1013,26 +1013,9 @@ class Orchestrator:
             if is_git_repo(pipeline.working_path):
                 try:
                     worktree_dir = create_worktree(pipeline.working_path, node_id, run_id)
-                    from types import SimpleNamespace
-                    wt_target = SimpleNamespace(**{k: getattr(execution_node.target, k) for k in execution_node.target.model_fields})
-                    wt_target.cwd = str(worktree_dir)
-                    execution_node = SimpleNamespace(
-                        id=execution_node.id, agent=execution_node.agent, prompt=execution_node.prompt,
-                        target=wt_target, timeout_seconds=execution_node.timeout_seconds,
-                        retries=execution_node.retries, retry_backoff_seconds=execution_node.retry_backoff_seconds,
-                        retry_backoff_max_seconds=execution_node.retry_backoff_max_seconds,
-                        retry_backoff_strategy=execution_node.retry_backoff_strategy,
-                        success_criteria=execution_node.success_criteria, tools=execution_node.tools,
-                        model=execution_node.model, capture=execution_node.capture, env=execution_node.env,
-                        extra_args=execution_node.extra_args, provider=execution_node.provider,
-                        mcps=execution_node.mcps, skills=execution_node.skills, schedule=execution_node.schedule,
-                        fanout_group=execution_node.fanout_group, fanout_member=execution_node.fanout_member,
-                        on_failure_restart=execution_node.on_failure_restart,
-                        fanout_dependencies=getattr(execution_node, 'fanout_dependencies', {}),
-                        executable=execution_node.executable,
-                        description=execution_node.description,
-                        repo_instructions_mode=execution_node.repo_instructions_mode,
-                    )
+                    execution_node = execution_node.model_copy(update={
+                        "target": execution_node.target.model_copy(update={"cwd": str(worktree_dir)})
+                    })
                 except Exception as exc:
                     await self._publish(run_id, "node_trace", node_id=node_id,
                         trace={"kind": "warning", "title": f"Worktree failed: {exc}"})
@@ -1075,7 +1058,7 @@ class Orchestrator:
             )
             if should_forward:
                 from agentflow.cloud.aws import collect_local_credentials
-                local_creds = collect_local_credentials(runtime_agent.value)
+                local_creds = collect_local_credentials(str(runtime_agent))
                 merged = {**local_creds, **prepared.env}
                 prepared = PreparedExecution(
                     command=prepared.command, env=merged, cwd=prepared.cwd,

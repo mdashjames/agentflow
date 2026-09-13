@@ -41,7 +41,7 @@ def _stringify(value: Any) -> str:
 @dataclass(slots=True)
 class BaseTraceParser:
     node_id: str
-    agent: AgentKind
+    agent: AgentKind | str
     attempt: int = 1
     final_chunks: list[str] = field(default_factory=list)
     last_message: str | None = None
@@ -351,7 +351,7 @@ class GenericTraceParser(BaseTraceParser):
         return [self.emit("stdout", "stdout", text, line)] if text else []
 
 
-def create_trace_parser(agent: AgentKind, node_id: str) -> BaseTraceParser:
+def create_trace_parser(agent: AgentKind | str, node_id: str) -> BaseTraceParser:
     match agent:
         case AgentKind.CODEX:
             return CodexTraceParser(node_id=node_id, agent=agent)

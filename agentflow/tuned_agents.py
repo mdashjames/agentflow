@@ -163,7 +163,7 @@ class EvolutionRequest(BaseModel):
 @dataclass(slots=True)
 class PreparedAgentResolution:
     node: NodeSpec
-    runtime_agent: AgentKind
+    runtime_agent: AgentKind | str
     version: TunedAgentVersion | None = None
 
 
@@ -292,10 +292,15 @@ def list_tuned_agent_records(workspace: Path) -> list[TunedAgentRecord]:
     return sorted(registry.agents.values(), key=lambda record: record.name)
 
 
-def resolve_node_for_execution(node: NodeSpec, workspace: Path) -> PreparedAgentResolution:
+def resolve_node_for_execution(node: NodeSpec, workspace: Path, registry=None) -> PreparedAgentResolution:
     resolved_agent = builtin_agent_kind(node.agent)
     if resolved_agent is not None:
         return PreparedAgentResolution(node=node, runtime_agent=resolved_agent)
+    if registry is None:
+        from agentflow.agents.registry import default_adapter_registry
+        registry = default_adapter_registry
+    if registry.contains(normalize_agent_name(node.agent)):
+        return PreparedAgentResolution(node=node, runtime_agent=normalize_agent_name(node.agent))
 
     version = resolve_tuned_agent_version(workspace, normalize_agent_name(node.agent))
     if version is None:

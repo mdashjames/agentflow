@@ -1,5 +1,8 @@
 """AgentFlow public package surface."""
 
+from agentflow.actors import ActorNode, ActorRequirements, ArtifactContract, InstructionBundle
+from agentflow.profiles import AgentProfile, BackendCapabilities, register_backend_capabilities
+
 from agentflow.dsl import (
     DAG,
     Graph,
@@ -25,6 +28,8 @@ def create_app(*args, **kwargs):
 
 
 __all__ = [
+    "ActorNode", "ActorRequirements", "ArtifactContract", "InstructionBundle",
+    "AgentProfile", "BackendCapabilities", "register_backend_capabilities",
     "DAG",
     "Graph",
     "InferenceSetup",
