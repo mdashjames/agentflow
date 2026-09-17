@@ -16,6 +16,7 @@ class CodexSessionCompletion:
     exit_code: int
     final_message: str | None = None
     terminal_event_seen_on_stdout: bool = False
+    final_agent_message_seen_on_stdout: bool = False
 
 
 class CodexSessionCompletionMonitor:
@@ -35,6 +36,7 @@ class CodexSessionCompletionMonitor:
         self.stall_grace_seconds = stall_grace_seconds
         self.thread_id: str | None = None
         self.terminal_event_seen_on_stdout = False
+        self._agent_messages_seen_on_stdout: set[str] = set()
         self._thread_started = asyncio.Event()
         self._initial_sessions = self._snapshot_sessions()
 
@@ -89,6 +91,33 @@ class CodexSessionCompletionMonitor:
                 self._thread_started.set()
         elif event_type in {"turn.completed", "turn.failed"}:
             self.terminal_event_seen_on_stdout = True
+        elif event_type in {"item.completed", "item/completed"}:
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                params = payload.get("params")
+                item = params.get("item") if isinstance(params, dict) else None
+            if isinstance(item, dict) and item.get("type") in {
+                "agent_message",
+                "agentMessage",
+            }:
+                text = item.get("text")
+                if isinstance(text, str):
+                    self._agent_messages_seen_on_stdout.add(text)
+
+    def with_current_stdout_observations(
+        self,
+        completion: CodexSessionCompletion,
+    ) -> CodexSessionCompletion:
+        final_message = completion.final_message
+        return CodexSessionCompletion(
+            exit_code=completion.exit_code,
+            final_message=final_message,
+            terminal_event_seen_on_stdout=self.terminal_event_seen_on_stdout,
+            final_agent_message_seen_on_stdout=(
+                final_message is not None
+                and final_message in self._agent_messages_seen_on_stdout
+            ),
+        )
 
     async def wait(self) -> CodexSessionCompletion:
         await self._thread_started.wait()
@@ -188,11 +217,7 @@ class CodexSessionCompletionMonitor:
                 and candidate_deadline is not None
                 and loop.time() >= candidate_deadline
             ):
-                return CodexSessionCompletion(
-                    exit_code=candidate.exit_code,
-                    final_message=candidate.final_message,
-                    terminal_event_seen_on_stdout=self.terminal_event_seen_on_stdout,
-                )
+                return self.with_current_stdout_observations(candidate)
             sleep_for = self._POLL_SECONDS
             if candidate_deadline is not None:
                 sleep_for = min(sleep_for, max(0, candidate_deadline - loop.time()))
@@ -203,7 +228,11 @@ class CodexSessionCompletionMonitor:
         if completion.terminal_event_seen_on_stdout:
             return []
         events: list[dict[str, Any]] = []
-        if completion.exit_code == 0 and completion.final_message:
+        if (
+            completion.exit_code == 0
+            and completion.final_message
+            and not completion.final_agent_message_seen_on_stdout
+        ):
             events.append(
                 {
                     "type": "item.completed",

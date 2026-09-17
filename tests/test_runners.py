@@ -14,7 +14,8 @@ import pytest
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.container import ContainerRunner
 from agentflow.runners.local import LocalRunner
-from agentflow.specs import LocalTarget, NodeSpec, PipelineSpec
+from agentflow.specs import AgentKind, LocalTarget, NodeSpec, PipelineSpec
+from agentflow.traces import create_trace_parser
 
 
 def _paths(tmp_path: Path) -> ExecutionPaths:
@@ -684,6 +685,7 @@ def _codex_session_script(
     terminal_event: str,
     final_message: str | None = None,
     stdout_terminal_delay_seconds: float | None = None,
+    stdout_final_item_delay_seconds: float | None = None,
     stdout_exit_code: int | None = None,
     descendant_pid_path: Path | None = None,
     descendant_ready_path: Path | None = None,
@@ -740,6 +742,23 @@ def _codex_session_script(
             """
         )
     indented_delayed_stdout = textwrap.indent(delayed_stdout, "        ")
+    delayed_final_item_stdout = ""
+    if stdout_final_item_delay_seconds is not None:
+        if final_message is None:
+            raise ValueError("final_message is required for delayed final item stdout")
+        delayed_final_item_stdout = textwrap.dedent(
+            f"""
+            time.sleep({stdout_final_item_delay_seconds!r})
+            print(json.dumps({{"type": "item.completed", "item": {{
+                "type": "agent_message",
+                "text": {final_message!r},
+            }}}}), flush=True)
+            """
+        )
+    indented_delayed_final_item_stdout = textwrap.indent(
+        delayed_final_item_stdout,
+        "        ",
+    )
     return textwrap.dedent(
         f"""
         import json
@@ -767,6 +786,7 @@ def _codex_session_script(
                 stream.write(json.dumps(record) + "\\n")
                 stream.flush()
 {indented_delayed_stdout}
+{indented_delayed_final_item_stdout}
         time.sleep(60)
         """
     )
@@ -887,6 +907,57 @@ async def test_local_runner_does_not_duplicate_terminal_stdout_arriving_during_g
         "turn.completed",
     ]
     assert all("recovered_from" not in event for event in stdout_events)
+
+
+@pytest.mark.asyncio
+async def test_local_runner_recovers_only_terminal_after_final_item_stdout(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.1)
+    codex_home = tmp_path / "codex-home"
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-partial-final-stdout",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[
+            sys.executable,
+            "-c",
+            _codex_session_script(
+                terminal_event="task_complete",
+                final_message="done",
+                stdout_final_item_delay_seconds=0.1,
+            ),
+        ],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False),
+        timeout=4,
+    )
+
+    stdout_events = [json.loads(line) for line in result.stdout_lines]
+    parser = create_trace_parser(AgentKind.CODEX, node.id)
+    for line in result.stdout_lines:
+        parser.feed(line)
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert [event["type"] for event in stdout_events] == [
+        "thread.started",
+        "item.completed",
+        "turn.completed",
+    ]
+    assert stdout_events[-1]["recovered_from"] == "codex_session"
+    assert parser.finalize() == "done"
 
 
 @pytest.mark.asyncio

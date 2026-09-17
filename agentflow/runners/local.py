@@ -542,11 +542,10 @@ class LocalRunner(Runner):
             if direct_exit_code is not None:
                 external_exit_code = direct_exit_code
                 codex_completion_result = None
-            if (
-                codex_completion_result is not None
-                and codex_monitor is not None
-                and not codex_monitor.terminal_event_seen_on_stdout
-            ):
+            if codex_completion_result is not None and codex_monitor is not None:
+                codex_completion_result = codex_monitor.with_current_stdout_observations(
+                    codex_completion_result
+                )
                 for line in CodexSessionCompletionMonitor.recovered_stdout_events(
                     codex_completion_result
                 ):
