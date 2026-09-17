@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import sys
 import textwrap
 
 import pytest
@@ -636,6 +637,191 @@ async def test_local_runner_timeout_uses_standard_exit_code(tmp_path: Path):
     assert result.exit_code == 124
     assert result.stdout_lines == ["ready"]
     assert result.stderr_lines == ["Timed out after 1s"]
+
+
+def _codex_session_script(*, terminal_event: str, final_message: str | None = None) -> str:
+    payload = {
+        "type": terminal_event,
+        "turn_id": "01a0afad-39d7-7ef3-a74c-7b14def5de2f",
+    }
+    if final_message is not None:
+        payload["last_agent_message"] = final_message
+    return textwrap.dedent(
+        f"""
+        import json
+        import os
+        import time
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        thread_id = "01a0afad-399c-71c1-b944-8421ddfa839a"
+        turn_id = "01a0afad-39d7-7ef3-a74c-7b14def5de2f"
+        session_dir = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "09" / "17"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_path = session_dir / f"rollout-{{thread_id}}.jsonl"
+        print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}), flush=True)
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        records = [
+            {{"timestamp": now, "type": "event_msg", "payload": {{"type": "task_started", "turn_id": turn_id}}}},
+            {{"timestamp": now, "type": "event_msg", "payload": {payload!r}}},
+        ]
+        with session_path.open("w", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record) + "\\n")
+                stream.flush()
+        time.sleep(60)
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_runner_recovers_completed_codex_session_when_cli_stalls(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.05)
+    codex_home = tmp_path / "codex-home"
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-completed-session-stall",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[
+            sys.executable,
+            "-c",
+            _codex_session_script(
+                terminal_event="task_complete",
+                final_message="Review complete.",
+            ),
+        ],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+    output: list[tuple[str, str]] = []
+
+    async def on_output(stream: str, line: str) -> None:
+        output.append((stream, line))
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), on_output, lambda: False),
+        timeout=3,
+    )
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    recovered = [json.loads(line) for stream, line in output if stream == "stdout"]
+    assert recovered[-2] == {
+        "type": "item.completed",
+        "item": {
+            "id": "agentflow_recovered_final",
+            "type": "agent_message",
+            "text": "Review complete.",
+        },
+        "recovered_from": "codex_session",
+    }
+    assert recovered[-1] == {
+        "type": "turn.completed",
+        "recovered_from": "codex_session",
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_runner_fails_closed_when_stalled_codex_session_is_aborted(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.05)
+    codex_home = tmp_path / "codex-home"
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-aborted-session-stall",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[sys.executable, "-c", _codex_session_script(terminal_event="turn_aborted")],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+    output: list[tuple[str, str]] = []
+
+    async def on_output(stream: str, line: str) -> None:
+        output.append((stream, line))
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), on_output, lambda: False),
+        timeout=3,
+    )
+
+    assert result.exit_code == 1
+    assert result.timed_out is False
+    assert json.loads(output[-1][1]) == {
+        "type": "turn.failed",
+        "recovered_from": "codex_session",
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_runner_ignores_completed_turn_from_prior_codex_invocation(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.05)
+    codex_home = tmp_path / "codex-home"
+    session_dir = codex_home / "sessions" / "2026" / "09" / "17"
+    session_dir.mkdir(parents=True)
+    thread_id = "01a0afad-399c-71c1-b944-8421ddfa839a"
+    session_path = session_dir / f"rollout-{thread_id}.jsonl"
+    old_records = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "prior-turn"},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "prior-turn"},
+        },
+    ]
+    session_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in old_records),
+        encoding="utf-8",
+    )
+    script = (
+        "import json, time; "
+        f"print(json.dumps({{'type':'thread.started','thread_id':'{thread_id}'}}), flush=True); "
+        "time.sleep(60)"
+    )
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-prior-completion",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 1,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[sys.executable, "-c", script],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False),
+        timeout=3,
+    )
+
+    assert result.exit_code == 124
+    assert result.timed_out is True
 
 
 @pytest.mark.asyncio
