@@ -1010,6 +1010,85 @@ async def test_local_runner_prefers_real_exit_during_external_completion_grace(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups are required")
+async def test_local_runner_prefers_returncode_while_exit_waiter_is_pending(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.2)
+    ready_path = tmp_path / "ready"
+
+    class NearDeadlineExitRunner(LocalRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saw_pending_waiter_after_exit = False
+
+        async def _wait_for_ready(self) -> int:
+            while not ready_path.exists():
+                await asyncio.sleep(0.001)
+            return 0
+
+        def _external_completion(self, node, prepared, paths):
+            return self._wait_for_ready()
+
+        async def _wait_for_returncode(self, process) -> int:
+            while process.returncode is None:
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.15)
+            return process.returncode
+
+        async def _terminate_with_fallback(
+            self,
+            process,
+            wait_task,
+            process_group_id=None,
+        ) -> None:
+            self.saw_pending_waiter_after_exit = (
+                process.returncode == 23 and not wait_task.done()
+            )
+            await super()._terminate_with_fallback(
+                process,
+                wait_task,
+                process_group_id,
+            )
+
+    script = textwrap.dedent(
+        f"""
+        import time
+        from pathlib import Path
+
+        Path({str(ready_path)!r}).write_text("ready", encoding="utf-8")
+        time.sleep(0.08)
+        raise SystemExit(23)
+        """
+    )
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-returncode-before-waiter",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[sys.executable, "-c", script],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+    runner = NearDeadlineExitRunner()
+
+    result = await asyncio.wait_for(
+        runner.execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False),
+        timeout=3,
+    )
+
+    assert runner.saw_pending_waiter_after_exit is True
+    assert result.exit_code == 23
+    assert result.timed_out is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups are required")
 async def test_local_runner_preserves_codex_exit_code_and_cleans_inherited_descendant(
     tmp_path: Path, monkeypatch
 ):

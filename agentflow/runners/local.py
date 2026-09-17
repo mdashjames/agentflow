@@ -531,7 +531,9 @@ class LocalRunner(Runner):
                 self._EXTERNAL_COMPLETION_GRACE_SECONDS,
                 process_group_id,
             )
-            direct_exit_code = wait_task.result() if wait_task.done() else None
+            # The subprocess transport records returncode before the polling
+            # waiter necessarily gets its next event-loop turn.
+            direct_exit_code = process.returncode
             if not process_tree_exited:
                 await self._terminate_with_fallback(
                     process,
