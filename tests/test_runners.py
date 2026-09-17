@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -639,21 +640,70 @@ async def test_local_runner_timeout_uses_standard_exit_code(tmp_path: Path):
     assert result.stderr_lines == ["Timed out after 1s"]
 
 
-def _codex_session_script(*, terminal_event: str, final_message: str | None = None) -> str:
+def _codex_session_script(
+    *,
+    terminal_event: str,
+    final_message: str | None = None,
+    descendant_pid_path: Path | None = None,
+    descendant_ready_path: Path | None = None,
+    descendant_terminated_path: Path | None = None,
+) -> str:
     payload = {
         "type": terminal_event,
         "turn_id": "01a0afad-39d7-7ef3-a74c-7b14def5de2f",
     }
     if final_message is not None:
         payload["last_agent_message"] = final_message
+    descendant_setup = ""
+    if (
+        descendant_pid_path is not None
+        and descendant_ready_path is not None
+        and descendant_terminated_path is not None
+    ):
+        child_script = textwrap.dedent(
+            f"""
+            import os
+            import signal
+            import time
+            from pathlib import Path
+
+            ready_path = Path({str(descendant_ready_path)!r})
+            terminated_path = Path({str(descendant_terminated_path)!r})
+
+            def terminate(_signum, _frame):
+                terminated_path.write_text("terminated", encoding="utf-8")
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, terminate)
+            ready_path.write_text(str(os.getpgrp()), encoding="utf-8")
+            while True:
+                time.sleep(1)
+            """
+        )
+        descendant_setup = textwrap.dedent(
+            f"""
+            descendant = subprocess.Popen([sys.executable, "-c", {child_script!r}])
+            Path({str(descendant_pid_path)!r}).write_text(str(descendant.pid), encoding="utf-8")
+            ready_path = Path({str(descendant_ready_path)!r})
+            deadline = time.monotonic() + 5
+            while not ready_path.exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("descendant did not start")
+                time.sleep(0.01)
+            """
+        )
+    indented_descendant_setup = textwrap.indent(descendant_setup, "        ")
     return textwrap.dedent(
         f"""
         import json
         import os
+        import subprocess
+        import sys
         import time
         from datetime import datetime, timezone
         from pathlib import Path
 
+{indented_descendant_setup}
         thread_id = "01a0afad-399c-71c1-b944-8421ddfa839a"
         turn_id = "01a0afad-39d7-7ef3-a74c-7b14def5de2f"
         session_dir = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "09" / "17"
@@ -675,12 +725,17 @@ def _codex_session_script(*, terminal_event: str, final_message: str | None = No
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups are required")
 async def test_local_runner_recovers_completed_codex_session_when_cli_stalls(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.1)
     codex_home = tmp_path / "codex-home"
+    descendant_pid_path = tmp_path / "descendant.pid"
+    descendant_ready_path = tmp_path / "descendant.ready"
+    descendant_terminated_path = tmp_path / "descendant.terminated"
     node = NodeSpec.model_validate(
         {
             "id": "codex-completed-session-stall",
@@ -696,6 +751,9 @@ async def test_local_runner_recovers_completed_codex_session_when_cli_stalls(
             _codex_session_script(
                 terminal_event="task_complete",
                 final_message="Review complete.",
+                descendant_pid_path=descendant_pid_path,
+                descendant_ready_path=descendant_ready_path,
+                descendant_terminated_path=descendant_terminated_path,
             ),
         ],
         env={"CODEX_HOME": str(codex_home)},
@@ -728,6 +786,18 @@ async def test_local_runner_recovers_completed_codex_session_when_cli_stalls(
         "type": "turn.completed",
         "recovered_from": "codex_session",
     }
+    descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+    assert int(descendant_ready_path.read_text(encoding="utf-8")) != os.getpgrp()
+    assert descendant_terminated_path.read_text(encoding="utf-8") == "terminated"
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("Codex descendant survived recovered completion")
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio

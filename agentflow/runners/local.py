@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import shlex
 from collections.abc import Awaitable
 from contextlib import suppress
@@ -244,13 +245,75 @@ class LocalRunner(Runner):
             return False
         return True
 
-    async def _terminate_with_fallback(self, process, wait_task: asyncio.Task[int]) -> None:
-        with suppress(ProcessLookupError):
+    def _process_group_exists(self, process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def _wait_for_process_tree_exit(
+        self,
+        wait_task: asyncio.Task[int],
+        timeout: float,
+        process_group_id: int | None,
+    ) -> bool:
+        if process_group_id is None:
+            return await self._wait_for_exit(wait_task, timeout)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            direct_process_exited = wait_task.done()
+            process_group_exited = not self._process_group_exists(process_group_id)
+            if direct_process_exited and process_group_exited:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if not direct_process_exited:
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.shield(wait_task),
+                        timeout=min(remaining, 0.05),
+                    )
+            else:
+                await asyncio.sleep(min(remaining, 0.05))
+
+    def _terminate_process_tree(self, process, process_group_id: int | None) -> None:
+        if process_group_id is not None:
+            os.killpg(process_group_id, signal.SIGTERM)
+        else:
             process.terminate()
-        if not await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS):
+
+    def _kill_process_tree(self, process, process_group_id: int | None) -> None:
+        if process_group_id is not None:
+            os.killpg(process_group_id, signal.SIGKILL)
+        else:
+            process.kill()
+
+    async def _terminate_with_fallback(
+        self,
+        process,
+        wait_task: asyncio.Task[int],
+        process_group_id: int | None = None,
+    ) -> None:
+        with suppress(ProcessLookupError):
+            self._terminate_process_tree(process, process_group_id)
+        if not await self._wait_for_process_tree_exit(
+            wait_task,
+            self._TERMINATE_GRACE_SECONDS,
+            process_group_id,
+        ):
             with suppress(ProcessLookupError):
-                process.kill()
-            await self._wait_for_exit(wait_task, self._TERMINATE_GRACE_SECONDS)
+                self._kill_process_tree(process, process_group_id)
+            await self._wait_for_process_tree_exit(
+                wait_task,
+                self._TERMINATE_GRACE_SECONDS,
+                process_group_id,
+            )
 
         # asyncio exposes no public Process.close(). If descendants inherited a
         # pipe, the transport otherwise survives after the direct child exits,
@@ -313,6 +376,12 @@ class LocalRunner(Runner):
         env = os.environ.copy()
         env.update(launch_env)
         command = self._inline_env_wrapper_assignments(command, launch_env)
+        isolate_process_group = (
+            os.name == "posix"
+            and node.target.kind == "local"
+            and prepared.trace_kind == "codex"
+        )
+        launch_options = {"start_new_session": True} if isolate_process_group else {}
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=prepared.cwd,
@@ -320,7 +389,9 @@ class LocalRunner(Runner):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE if prepared.stdin is not None else asyncio.subprocess.DEVNULL,
+            **launch_options,
         )
+        process_group_id = process.pid if isolate_process_group else None
         if prepared.stdin is not None and process.stdin is not None:
             process.stdin.write(prepared.stdin.encode("utf-8"))
             await process.stdin.drain()
@@ -440,20 +511,26 @@ class LocalRunner(Runner):
                             await task
 
         if timed_out:
-            await self._terminate_with_fallback(process, wait_task)
+            await self._terminate_with_fallback(process, wait_task, process_group_id)
             await _drain_streams()
             stderr_lines.append(f"Timed out after {node.timeout_seconds}s")
             await on_output("stderr", stderr_lines[-1])
         elif cancelled:
-            await self._terminate_with_fallback(process, wait_task)
+            await self._terminate_with_fallback(process, wait_task, process_group_id)
             await _drain_streams()
             stderr_lines.append("Cancelled by user")
             await on_output("stderr", stderr_lines[-1])
         elif external_exit_code is not None:
-            if not await self._wait_for_exit(
-                wait_task, self._EXTERNAL_COMPLETION_GRACE_SECONDS
+            if not await self._wait_for_process_tree_exit(
+                wait_task,
+                self._EXTERNAL_COMPLETION_GRACE_SECONDS,
+                process_group_id,
             ):
-                await self._terminate_with_fallback(process, wait_task)
+                await self._terminate_with_fallback(
+                    process,
+                    wait_task,
+                    process_group_id,
+                )
             await _drain_streams()
             if codex_completion_result is not None:
                 for line in CodexSessionCompletionMonitor.recovered_stdout_events(
@@ -462,9 +539,17 @@ class LocalRunner(Runner):
                     stdout_lines.append(line)
                     await on_output("stdout", line)
         else:
-            await _drain_streams()
             if not wait_task.done():
                 await wait_task
+            if process_group_id is not None and self._process_group_exists(
+                process_group_id
+            ):
+                await self._terminate_with_fallback(
+                    process,
+                    wait_task,
+                    process_group_id,
+                )
+            await _drain_streams()
 
         if external_task is not None:
             if not external_task.done():
