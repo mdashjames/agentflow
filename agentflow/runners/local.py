@@ -526,18 +526,27 @@ class LocalRunner(Runner):
             stderr_lines.append("Cancelled by user")
             await on_output("stderr", stderr_lines[-1])
         elif external_exit_code is not None:
-            if not await self._wait_for_process_tree_exit(
+            process_tree_exited = await self._wait_for_process_tree_exit(
                 wait_task,
                 self._EXTERNAL_COMPLETION_GRACE_SECONDS,
                 process_group_id,
-            ):
+            )
+            direct_exit_code = wait_task.result() if wait_task.done() else None
+            if not process_tree_exited:
                 await self._terminate_with_fallback(
                     process,
                     wait_task,
                     process_group_id,
                 )
             await _drain_streams()
-            if codex_completion_result is not None:
+            if direct_exit_code is not None:
+                external_exit_code = direct_exit_code
+                codex_completion_result = None
+            if (
+                codex_completion_result is not None
+                and codex_monitor is not None
+                and not codex_monitor.terminal_event_seen_on_stdout
+            ):
                 for line in CodexSessionCompletionMonitor.recovered_stdout_events(
                     codex_completion_result
                 ):

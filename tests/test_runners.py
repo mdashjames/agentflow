@@ -684,6 +684,7 @@ def _codex_session_script(
     terminal_event: str,
     final_message: str | None = None,
     stdout_terminal_delay_seconds: float | None = None,
+    stdout_exit_code: int | None = None,
     descendant_pid_path: Path | None = None,
     descendant_ready_path: Path | None = None,
     descendant_terminated_path: Path | None = None,
@@ -719,10 +720,23 @@ def _codex_session_script(
     indented_descendant_setup = textwrap.indent(descendant_setup, "        ")
     delayed_stdout = ""
     if stdout_terminal_delay_seconds is not None:
+        final_stdout = ""
+        if stdout_exit_code is not None and final_message is not None:
+            final_stdout = (
+                f'print(json.dumps({{"type": "item.completed", "item": '
+                f'{{"type": "agent_message", "text": {final_message!r}}}}}), flush=True)'
+            )
+        exit_stdout = (
+            f"raise SystemExit({stdout_exit_code})"
+            if stdout_exit_code is not None
+            else ""
+        )
         delayed_stdout = textwrap.dedent(
             f"""
             time.sleep({stdout_terminal_delay_seconds!r})
+            {final_stdout}
             print(json.dumps({{"type": "turn.completed"}}), flush=True)
+            {exit_stdout}
             """
         )
     indented_delayed_stdout = textwrap.indent(delayed_stdout, "        ")
@@ -870,6 +884,54 @@ async def test_local_runner_does_not_duplicate_terminal_stdout_arriving_during_g
     assert result.timed_out is False
     assert [event["type"] for event in stdout_events] == [
         "thread.started",
+        "turn.completed",
+    ]
+    assert all("recovered_from" not in event for event in stdout_events)
+
+
+@pytest.mark.asyncio
+async def test_local_runner_prefers_real_exit_during_external_completion_grace(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 1.0)
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.1)
+    codex_home = tmp_path / "codex-home"
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-real-exit-during-external-grace",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[
+            sys.executable,
+            "-c",
+            _codex_session_script(
+                terminal_event="task_complete",
+                final_message="Review complete.",
+                stdout_terminal_delay_seconds=0.6,
+                stdout_exit_code=23,
+            ),
+        ],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False),
+        timeout=4,
+    )
+
+    stdout_events = [json.loads(line) for line in result.stdout_lines]
+    assert result.exit_code == 23
+    assert result.timed_out is False
+    assert [event["type"] for event in stdout_events] == [
+        "thread.started",
+        "item.completed",
         "turn.completed",
     ]
     assert all("recovered_from" not in event for event in stdout_events)
