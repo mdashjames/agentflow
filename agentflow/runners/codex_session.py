@@ -188,7 +188,11 @@ class CodexSessionCompletionMonitor:
                 and candidate_deadline is not None
                 and loop.time() >= candidate_deadline
             ):
-                return candidate
+                return CodexSessionCompletion(
+                    exit_code=candidate.exit_code,
+                    final_message=candidate.final_message,
+                    terminal_event_seen_on_stdout=self.terminal_event_seen_on_stdout,
+                )
             sleep_for = self._POLL_SECONDS
             if candidate_deadline is not None:
                 sleep_for = min(sleep_for, max(0, candidate_deadline - loop.time()))
