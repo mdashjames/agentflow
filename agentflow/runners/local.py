@@ -245,6 +245,11 @@ class LocalRunner(Runner):
             return False
         return True
 
+    async def _wait_for_returncode(self, process) -> int:
+        while process.returncode is None:
+            await asyncio.sleep(0.05)
+        return process.returncode
+
     def _process_group_exists(self, process_group_id: int) -> bool:
         try:
             os.killpg(process_group_id, 0)
@@ -382,6 +387,13 @@ class LocalRunner(Runner):
             and prepared.trace_kind == "codex"
         )
         launch_options = {"start_new_session": True} if isolate_process_group else {}
+        codex_monitor = CodexSessionCompletionMonitor.for_execution(
+            trace_kind=prepared.trace_kind,
+            target_kind=node.target.kind,
+            command=prepared.command,
+            env=launch_env,
+            stall_grace_seconds=self._CODEX_COMPLETION_STALL_GRACE_SECONDS,
+        )
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=prepared.cwd,
@@ -401,13 +413,6 @@ class LocalRunner(Runner):
 
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
-        codex_monitor = CodexSessionCompletionMonitor.for_execution(
-            trace_kind=prepared.trace_kind,
-            target_kind=node.target.kind,
-            command=prepared.command,
-            env=launch_env,
-            stall_grace_seconds=self._CODEX_COMPLETION_STALL_GRACE_SECONDS,
-        )
         stdout_task = asyncio.create_task(
             self._consume_stream(
                 node,
@@ -419,7 +424,7 @@ class LocalRunner(Runner):
             )
         )
         stderr_task = asyncio.create_task(self._consume_stream(node, process.stderr, "stderr", stderr_lines, on_output))
-        wait_task = asyncio.create_task(process.wait())
+        wait_task = asyncio.create_task(self._wait_for_returncode(process))
         external_completion = self._external_completion(node, prepared, paths)
         if external_completion is None and codex_monitor is not None:
             external_completion = codex_monitor.wait()

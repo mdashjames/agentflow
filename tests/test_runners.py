@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -640,6 +641,44 @@ async def test_local_runner_timeout_uses_standard_exit_code(tmp_path: Path):
     assert result.stderr_lines == ["Timed out after 1s"]
 
 
+def _terminating_descendant_script(
+    ready_path: Path,
+    terminated_path: Path,
+) -> str:
+    return textwrap.dedent(
+        f"""
+        import os
+        import signal
+        import time
+        from pathlib import Path
+
+        ready_path = Path({str(ready_path)!r})
+        terminated_path = Path({str(terminated_path)!r})
+
+        def terminate(_signum, _frame):
+            terminated_path.write_text("terminated", encoding="utf-8")
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, terminate)
+        ready_path.write_text(str(os.getpgrp()), encoding="utf-8")
+        while True:
+            time.sleep(1)
+        """
+    )
+
+
+async def _assert_process_gone(pid: int, message: str) -> None:
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(message)
+        await asyncio.sleep(0.05)
+
+
 def _codex_session_script(
     *,
     terminal_event: str,
@@ -660,25 +699,9 @@ def _codex_session_script(
         and descendant_ready_path is not None
         and descendant_terminated_path is not None
     ):
-        child_script = textwrap.dedent(
-            f"""
-            import os
-            import signal
-            import time
-            from pathlib import Path
-
-            ready_path = Path({str(descendant_ready_path)!r})
-            terminated_path = Path({str(descendant_terminated_path)!r})
-
-            def terminate(_signum, _frame):
-                terminated_path.write_text("terminated", encoding="utf-8")
-                raise SystemExit(0)
-
-            signal.signal(signal.SIGTERM, terminate)
-            ready_path.write_text(str(os.getpgrp()), encoding="utf-8")
-            while True:
-                time.sleep(1)
-            """
+        child_script = _terminating_descendant_script(
+            descendant_ready_path,
+            descendant_terminated_path,
         )
         descendant_setup = textwrap.dedent(
             f"""
@@ -789,15 +812,72 @@ async def test_local_runner_recovers_completed_codex_session_when_cli_stalls(
     descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
     assert int(descendant_ready_path.read_text(encoding="utf-8")) != os.getpgrp()
     assert descendant_terminated_path.read_text(encoding="utf-8") == "terminated"
-    deadline = time.monotonic() + 2
-    while True:
-        try:
-            os.kill(descendant_pid, 0)
-        except ProcessLookupError:
-            break
-        if time.monotonic() >= deadline:
-            pytest.fail("Codex descendant survived recovered completion")
-        await asyncio.sleep(0.05)
+    await _assert_process_gone(
+        descendant_pid,
+        "Codex descendant survived recovered completion",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups are required")
+async def test_local_runner_preserves_codex_exit_code_and_cleans_inherited_descendant(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.1)
+    descendant_pid_path = tmp_path / "normal-descendant.pid"
+    descendant_ready_path = tmp_path / "normal-descendant.ready"
+    descendant_terminated_path = tmp_path / "normal-descendant.terminated"
+    child_script = _terminating_descendant_script(
+        descendant_ready_path,
+        descendant_terminated_path,
+    )
+    parent_script = textwrap.dedent(
+        f"""
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        descendant = subprocess.Popen([sys.executable, "-c", {child_script!r}])
+        Path({str(descendant_pid_path)!r}).write_text(str(descendant.pid), encoding="utf-8")
+        ready_path = Path({str(descendant_ready_path)!r})
+        deadline = time.monotonic() + 5
+        while not ready_path.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("descendant did not start")
+            time.sleep(0.01)
+        raise SystemExit(23)
+        """
+    )
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-normal-exit-with-descendant",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[sys.executable, "-c", parent_script],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False),
+        timeout=3,
+    )
+
+    descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+    assert result.exit_code == 23
+    assert result.timed_out is False
+    assert int(descendant_ready_path.read_text(encoding="utf-8")) != os.getpgrp()
+    assert descendant_terminated_path.read_text(encoding="utf-8") == "terminated"
+    await _assert_process_gone(
+        descendant_pid,
+        "Codex descendant survived normal root exit",
+    )
 
 
 @pytest.mark.asyncio
@@ -892,6 +972,111 @@ async def test_local_runner_ignores_completed_turn_from_prior_codex_invocation(
 
     assert result.exit_code == 124
     assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_codex_completion_monitor_uses_launch_boundary_and_latest_retry(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(LocalRunner, "_CODEX_COMPLETION_STALL_GRACE_SECONDS", 0.15)
+    monkeypatch.setattr(LocalRunner, "_EXTERNAL_COMPLETION_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(LocalRunner, "_TERMINATE_GRACE_SECONDS", 0.1)
+    codex_home = tmp_path / "codex-home"
+    session_dir = codex_home / "sessions" / "2026" / "09" / "17"
+    session_dir.mkdir(parents=True)
+    thread_id = "01a0afad-399c-71c1-b944-8421ddfa839a"
+    session_path = session_dir / f"rollout-{thread_id}.jsonl"
+    prior_turn = "01a0afad-1111-7111-a111-111111111111"
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    prior_records = [
+        {
+            "timestamp": now,
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": prior_turn},
+        },
+        {
+            "timestamp": now,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": prior_turn,
+                "last_agent_message": "prior invocation",
+            },
+        },
+    ]
+    session_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in prior_records),
+        encoding="utf-8",
+    )
+    first_turn = "01a0afad-2222-7222-a222-222222222222"
+    retry_turn = "01a0afad-3333-7333-a333-333333333333"
+    script = textwrap.dedent(
+        f"""
+        import json
+        import time
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        path = Path({str(session_path)!r})
+        print(json.dumps({{"type": "thread.started", "thread_id": {thread_id!r}}}), flush=True)
+
+        def append(payload):
+            record = {{
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "type": "event_msg",
+                "payload": payload,
+            }}
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\\n")
+
+        append({{"type": "task_started", "turn_id": {first_turn!r}}})
+        append({{
+            "type": "task_complete",
+            "turn_id": {first_turn!r},
+            "last_agent_message": "superseded attempt",
+        }})
+        time.sleep(0.1)
+        append({{"type": "task_started", "turn_id": {retry_turn!r}}})
+        time.sleep(0.05)
+        append({{
+            "type": "task_complete",
+            "turn_id": {retry_turn!r},
+            "last_agent_message": "latest retry",
+        }})
+        time.sleep(60)
+        """
+    )
+    node = NodeSpec.model_validate(
+        {
+            "id": "codex-resume-retry-race",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 30,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[sys.executable, "-c", script],
+        env={"CODEX_HOME": str(codex_home)},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+    output: list[tuple[str, str]] = []
+
+    async def on_output(stream: str, line: str) -> None:
+        output.append((stream, line))
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), on_output, lambda: False),
+        timeout=3,
+    )
+
+    recovered = [
+        json.loads(line)
+        for stream, line in output
+        if stream == "stdout" and json.loads(line).get("type") == "item.completed"
+    ]
+    assert result.exit_code == 0
+    assert recovered[-1]["item"]["text"] == "latest retry"
 
 
 @pytest.mark.asyncio
